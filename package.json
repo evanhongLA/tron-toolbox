@@ -1,0 +1,12 @@
+{
+  "name": "tron-toolbox",
+  "version": "0.1.0",
+  "description": "Practical TRON CLI tools: asset dashboard, income report, JustLend liquidation-risk monitor, vote-reward auto-claimer, testnet energy burner.",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=18" },
+  "keywords": ["tron", "trx", "usdt", "justlend", "trongrid", "energy", "staking", "defi"],
+  "dependencies": {
+    "tronweb": "^6.0.0"
+  }
+}

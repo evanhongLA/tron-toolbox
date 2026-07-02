@@ -1,0 +1,4 @@
+# 一行一个 T 地址，可选跟别名（空格分隔），# 开头为注释
+# One address per line; optional label after whitespace.
+TXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX 主钱包
+TYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY

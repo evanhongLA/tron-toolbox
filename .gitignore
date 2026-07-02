@@ -1,0 +1,15 @@
+node_modules/
+.env
+wallets.txt
+senders.txt
+lend-wallets.txt
+keys.txt
+*.pid
+*.state.json
+*history.json
+claim-vote-rewards.last
+tron-income-*.csv
+tron-income-*.html
+tron-asset-summary.html
+.DS_Store
+._*
