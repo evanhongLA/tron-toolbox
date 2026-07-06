@@ -6,7 +6,9 @@
  * 逐个扫描钱包，查 getReward（未领取投票分红，单位 SUN）：
  *   有可领取的，就用 WithdrawBalanceContract 领取到该钱包自身余额。
  *
- * 链上规则：每个账户 24h 只能领取一次；daemon 按「距上次成功领取 ≥48h」调度。
+ * 领取条件：单钱包可领投票收益 ≥ CLAIM_MIN_REWARD_TRX（默认 100 TRX）才执行；低于阈值跳过。
+ * 链上规则：每个账户 24h 只能领取一次；万一 <24h 记为冷却跳过。
+ * 调度：推荐 crontab 每 2 天检查（见 claim-rewards-cron.sh.example）；--daemon 每 48h 检查一轮。
  *
  * 私钥（⚠️ 请只在自己可控的机器上使用；文件权限建议 chmod 600）：
  *   环境变量 PRIVATE_KEYS=hex1,hex2,…  或当前目录 keys.txt（一行一个 hex 私钥，# 注释）
@@ -17,7 +19,7 @@
  *   node claim-vote-rewards.mjs            # 交互终端=预览后 y/n
  *   node claim-vote-rewards.mjs --yes      # 直接执行（cron 用）
  *   node claim-vote-rewards.mjs --dry      # 只看可领取金额，不领
- *   node claim-vote-rewards.mjs --daemon   # 常驻，距上次成功领取 ≥48h 自动领
+ *   node claim-vote-rewards.mjs --daemon   # 常驻，每 48h 检查，≥100 TRX 才领
  */
 import './lib/env.mjs';
 import readline from 'node:readline';
@@ -27,12 +29,16 @@ import { TronWeb } from 'tronweb';
 const argv = process.argv.slice(2);
 const DO = argv.includes('--yes');
 const DRY = argv.includes('--dry') || argv.includes('--dry-run') || argv.includes('--preview');
-const DAEMON = argv.includes('--daemon') || process.env.CLAIM_DAEMON === '1';
-const MIN_GAP_H = Number(process.env.CLAIM_MIN_GAP_HOURS ?? 48);
-const GAP_MS = MIN_GAP_H * 3600000;
-const RETRY_NO_REWARD_MS = Number(process.env.CLAIM_RETRY_NO_REWARD_H ?? 24) * 3600000;
+const DAEMON = argv.includes('--daemon') || process.env.CLAIM_DAEMON === '1'; // 常驻：每 CHECK_INTERVAL_H 检查一轮
+const _rawMinTrx = Number(process.env.CLAIM_MIN_REWARD_TRX ?? 100);
+const MIN_REWARD_TRX = Number.isFinite(_rawMinTrx) && _rawMinTrx > 0 ? _rawMinTrx : 100;
+const MIN_REWARD_SUN = Math.floor(MIN_REWARD_TRX * 1e6);
+const _rawCheckH = Number(process.env.CLAIM_CHECK_INTERVAL_H ?? 48);
+const CHECK_INTERVAL_H = Number.isFinite(_rawCheckH) && _rawCheckH > 0 ? _rawCheckH : 48; // daemon/cron 建议间隔（小时）
+const CHECK_MS = CHECK_INTERVAL_H * 3600000;
 const RETRY_COOLDOWN_MS = Number(process.env.CLAIM_RETRY_COOLDOWN_H ?? 25) * 3600000;
 const RETRY_FAIL_MS = Number(process.env.CLAIM_RETRY_FAIL_H ?? 6) * 3600000;
+const meetsThreshold = (sun) => Number(sun) >= MIN_REWARD_SUN;
 const PERMISSION_ID = process.env.PERMISSION_ID ? Number(process.env.PERMISSION_ID) : null;
 
 const FULL_HOST = process.env.TRON_FULL_HOST || 'https://api.trongrid.io';
@@ -87,6 +93,7 @@ async function claimOne({ address: owner, pk }) {
   try { reward = Number(await tronWeb.trx.getReward(owner)) || 0; }
   catch (e) { return { owner, status: 'fail', reason: `查收益失败: ${e.message}` }; }
   if (reward <= 0) return { owner, status: 'none', reward: 0 };
+  if (!meetsThreshold(reward)) return { owner, status: 'below', reward };
   if (DRY) return { owner, status: 'dry', reward };
 
   try {
@@ -118,12 +125,14 @@ async function doClaimRun({ requireConfirm }) {
     let reward = 0;
     try { reward = Number(await tronWeb.trx.getReward(w.address)) || 0; } catch { reward = -1; }
     previews.push({ ...w, reward });
-    log(`  ${sa(w.address)} 可领取 ${reward < 0 ? '查询失败' : `${trx(reward)} TRX`}`);
+    const below = reward >= 0 && reward > 0 && !meetsThreshold(reward);
+    log(`  ${sa(w.address)} 可领取 ${reward < 0 ? '查询失败' : `${trx(reward)} TRX${below ? `（未达 ${MIN_REWARD_TRX} TRX 阈值，跳过）` : ''}`}`);
     await sleep(200);
   }
-  const claimable = previews.filter((p) => p.reward > 0);
+  const claimable = previews.filter((p) => meetsThreshold(p.reward));
   const total = claimable.reduce((s, p) => s + p.reward, 0);
-  log(`合计可领取：${trx(total)} TRX（${claimable.length}/${WALLETS.length} 个钱包有收益）`);
+  const belowN = previews.filter((p) => p.reward > 0 && !meetsThreshold(p.reward)).length;
+  log(`合计可领（≥${MIN_REWARD_TRX} TRX）：${trx(total)} TRX（${claimable.length}/${WALLETS.length} 个钱包；${belowN} 个未达阈值）`);
 
   if (DRY) { log('（--dry 模式，未领取）'); return { fail: 0, ok: 0, cooldown: 0, claimable: claimable.length }; }
   if (!claimable.length) { log('无可领取收益。'); return { fail: 0, ok: 0, cooldown: 0, claimable: 0 }; }
@@ -133,6 +142,7 @@ async function doClaimRun({ requireConfirm }) {
   for (const w of claimable) {
     const r = await claimOne(w);
     if (r.status === 'ok') { ok += 1; claimed += r.reward; log(`✅ ${sa(w.address)} 领取 ${trx(r.reward)} TRX  txid=${r.txid || ''}`); }
+    else if (r.status === 'below') { log(`⏭ ${sa(w.address)} 跳过（${trx(r.reward)} TRX < ${MIN_REWARD_TRX} TRX）`); }
     else if (r.status === 'cooldown') { cooldown += 1; log(`⏳ ${sa(w.address)} 跳过（24h 冷却中）`); }
     else if (r.status === 'none') { /* 期间变 0 */ }
     else { fail += 1; log(`❌ ${sa(w.address)} 失败：${r.reason}`); }
@@ -142,71 +152,60 @@ async function doClaimRun({ requireConfirm }) {
   return { fail, ok, cooldown, claimable: claimable.length };
 }
 
-// ---- daemon：常驻，距上次成功领取 ≥48h 再领 ----
+// ---- daemon：常驻，每 CHECK_INTERVAL_H 检查一轮（≥MIN_REWARD_TRX 才领）----
 const LAST_FILE = new URL('./claim-vote-rewards.last', import.meta.url).pathname;
 const PID_FILE = new URL('./claim-vote-rewards.pid', import.meta.url).pathname;
 const readLast = () => { try { return Number(fs.readFileSync(LAST_FILE, 'utf8').trim()) || 0; } catch { return 0; } };
 const writeLast = (t) => { try { fs.writeFileSync(LAST_FILE, String(t)); } catch { /* ignore */ } };
 
-function logNextClaim(last) {
-  if (!last) {
-    log('尚无成功领取记录，首轮立即执行');
-    return;
-  }
-  const wait = last + GAP_MS - Date.now();
-  const nextAt = new Date(last + GAP_MS).toISOString();
-  if (wait <= 0) log(`距上次成功领取 ${((Date.now() - last) / 3600000).toFixed(1)}h（≥${MIN_GAP_H}h），即将执行`);
-  else log(`下次领取：${nextAt}（${(wait / 3600000).toFixed(1)}h 后；上次成功 ${new Date(last).toISOString()}）`);
+function logNextCheck(lastCheck) {
+  if (!lastCheck) { log('首轮立即检查'); return; }
+  const wait = lastCheck + CHECK_MS - Date.now();
+  const nextAt = new Date(lastCheck + CHECK_MS).toISOString();
+  if (wait <= 0) log(`距上次检查 ${((Date.now() - lastCheck) / 3600000).toFixed(1)}h，即将执行`);
+  else log(`下次检查：${nextAt}（${(wait / 3600000).toFixed(1)}h 后）`);
 }
 
 async function runDaemon() {
-  log(`daemon 启动：距上次成功领取 ≥${MIN_GAP_H}h 再领  PID=${process.pid}`);
+  log(`daemon 启动：每 ${CHECK_INTERVAL_H}h 检查，单钱包 ≥${MIN_REWARD_TRX} TRX 才领  PID=${process.pid}`);
   try { fs.writeFileSync(PID_FILE, String(process.pid)); } catch { /* ignore */ }
   const cleanup = () => { try { fs.unlinkSync(PID_FILE); } catch { /* ignore */ } };
   process.on('exit', cleanup);
-  logNextClaim(readLast());
+  logNextCheck(readLast());
   const bye = (sig) => { log(`收到 ${sig}，退出`); cleanup(); process.exit(0); };
   process.on('SIGINT', () => bye('SIGINT'));
   process.on('SIGTERM', () => bye('SIGTERM'));
+
   for (;;) {
-    const last = readLast();
-    if (last) {
-      const wait = last + GAP_MS - Date.now();
-      if (wait > 0) {
-        logNextClaim(last);
-        await sleep(wait);
-      }
+    const lastCheck = readLast();
+    if (lastCheck) {
+      const wait = lastCheck + CHECK_MS - Date.now();
+      if (wait > 0) { logNextCheck(lastCheck); await sleep(wait); }
     }
-    log('=== 开始领取 ===');
+    log(`=== 开始检查（阈值 ≥${MIN_REWARD_TRX} TRX）===`);
+    writeLast(Date.now());
     let result;
     try { result = await doClaimRun({ requireConfirm: false }); }
-    catch (e) { log('本轮异常：', e.message); await sleep(RETRY_FAIL_MS); continue; }
-    if (result.ok > 0) {
-      writeLast(Date.now());
-      log(`已领取 ${result.ok} 个钱包，${MIN_GAP_H}h 后下一轮`);
-      continue;
+    catch (e) {
+      log('本轮异常：', e.message); await sleep(RETRY_FAIL_MS); continue;
     }
-    if (result.cooldown > 0 && result.fail === 0) {
+    if (result.cooldown > 0 && result.fail === 0 && result.ok === 0) {
       log(`链上 24h 冷却（${result.cooldown} 个钱包），${RETRY_COOLDOWN_MS / 3600000}h 后重试`);
       await sleep(RETRY_COOLDOWN_MS);
       continue;
     }
-    if (result.claimable === 0) {
-      log(`暂无可领收益，${RETRY_NO_REWARD_MS / 3600000}h 后再查`);
-      await sleep(RETRY_NO_REWARD_MS);
+    if (result.fail > 0) {
+      log(`领取失败 ${result.fail} 个，${RETRY_FAIL_MS / 3600000}h 后重试`);
+      await sleep(RETRY_FAIL_MS);
       continue;
     }
-    log(`领取失败 ${result.fail} 个，${RETRY_FAIL_MS / 3600000}h 后重试`);
-    await sleep(RETRY_FAIL_MS);
+    log(`本轮完成：领取 ${result.ok} 个；${CHECK_INTERVAL_H}h 后再检查`);
+    await sleep(CHECK_MS);
   }
 }
 
 (async () => {
   if (DAEMON) { await runDaemon(); return; }
   const r = await doClaimRun({ requireConfirm: true });
-  if (r?.ok > 0) {
-    writeLast(Date.now());
-    log(`已写入领取时间（daemon 将从此刻起 ${MIN_GAP_H}h 后再自动领）`);
-  }
   if (r?.fail) process.exit(1);
 })().catch((e) => { console.error(ts(), '[claim-rewards] 脚本出错：', e.message); process.exit(1); });

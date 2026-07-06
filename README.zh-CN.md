@@ -46,7 +46,7 @@ node justlend-health-watch.mjs --dry    # 风险监控（只打印）
 
 ### 投票收益领取 `claim-vote-rewards.mjs`
 
-⚠️ 需要私钥（`PRIVATE_KEYS` 环境变量或 `keys.txt`，建议 `chmod 600`，只在自己可控的机器上运行）。链上每账户 24h 限领一次；`--daemon` 按 ≥48h 间隔自动领。私钥若是账户的受限 active 权限（权限位含 13 WithdrawBalance），设 `PERMISSION_ID` 走多签。
+⚠️ 需要私钥（`PRIVATE_KEYS` 环境变量或 `keys.txt`，建议 `chmod 600`，只在自己可控的机器上运行）。链上每账户 24h 限领一次；单钱包可领 ≥ `CLAIM_MIN_REWARD_TRX`（默认 100 TRX）才执行；推荐 crontab 每 2 天检查，或 `--daemon` 按 `CLAIM_CHECK_INTERVAL_H`（默认 48h）轮询。私钥若是账户的受限 active 权限（权限位含 13 WithdrawBalance），设 `PERMISSION_ID` 走多签。
 
 ### 测试网能量消耗 `burn-energy.mjs`
 
